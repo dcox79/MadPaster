@@ -1,0 +1,5 @@
+// MadPaster Resource File
+
+#define IDI_APPICON 100
+
+IDI_APPICON ICON "MadPaster.ico"
