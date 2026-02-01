@@ -1,6 +1,6 @@
 # MadPaster
 
-A Windows utility that simulates keyboard strokes to paste clipboard or file content. Useful for environments where traditional paste (Ctrl+V) doesn't work, such as noVNC consoles in Proxmox or other remote desktop environments.
+A Windows utility that simulates keyboard strokes to paste clipboard or file content. Built primarily for enterprise remote desktop environments where traditional paste (Ctrl+V) doesn't work, such as Azure Virtual Desktop (AVD), Citrix, and Azure Bastion. Also works with noVNC consoles, Proxmox, VMware, and other virtualization platforms.
 
 ![MadPaster Logo](MadPaster.png)
 
@@ -17,8 +17,10 @@ A Windows utility that simulates keyboard strokes to paste clipboard or file con
 
 ## Use Cases
 
-- Pasting into noVNC/VNC console windows
-- Remote desktop environments that don't support clipboard
+- **Azure Virtual Desktop (AVD)** - When clipboard redirection is disabled or restricted
+- **Citrix Virtual Apps/Desktops** - Bypassing clipboard policies in locked-down environments
+- **Azure Bastion** - Pasting into browser-based VM consoles
+- noVNC/VNC console windows
 - Virtual machine consoles (Proxmox, VMware, VirtualBox)
 - Serial terminal connections
 - Any application where standard paste doesn't work
