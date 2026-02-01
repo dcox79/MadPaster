@@ -13,6 +13,7 @@
 #include <commdlg.h>    // For GetOpenFileName file dialog
 #include <shellapi.h>   // For Shell_NotifyIcon (system tray)
 #include <gdiplus.h>    // For PNG image loading
+#include <mmsystem.h>   // For timeBeginPeriod/timeEndPeriod
 #include <string>
 #include <vector>
 
@@ -21,12 +22,18 @@ using namespace Gdiplus;
 // Link common controls
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "winmm.lib")
 
 // ============================================================================
 // Constants and Control IDs
 // ============================================================================
 
 const int maxchar = 45000;
+
+// Input injection constants
+const int CHUNK_SIZE = 16;            // Characters per SendInput batch (small chunks for reliability)
+const int NEWLINE_PAUSE_MS = 10;      // Extra pause after newlines
+const int MAX_RETRY_COUNT = 3;        // Retries on partial SendInput
 
 // Window dimensions
 const int WINDOW_WIDTH = 400;
@@ -349,50 +356,203 @@ std::wstring showFileOpenDialog(HWND hwndOwner) {
 }
 
 // ============================================================================
+// Input Injection Subsystem
+// ============================================================================
+
+namespace inject {
+
+// RAII guard for high-resolution timer (1ms instead of ~15.6ms default)
+struct TimerResolutionGuard {
+    TimerResolutionGuard() { timeBeginPeriod(1); }
+    ~TimerResolutionGuard() { timeEndPeriod(1); }
+};
+
+// Send modifier reset fence - releases all modifier keys
+void ResetModifiers() {
+    INPUT inputs[6] = {};
+
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_LSHIFT;
+    inputs[0].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_RSHIFT;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = VK_LCONTROL;
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_RCONTROL;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[4].type = INPUT_KEYBOARD;
+    inputs[4].ki.wVk = VK_LMENU;
+    inputs[4].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[5].type = INPUT_KEYBOARD;
+    inputs[5].ki.wVk = VK_RMENU;
+    inputs[5].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    SendInput(6, inputs, sizeof(INPUT));
+}
+
+// Flush accumulated INPUT events - loops until ALL events are sent
+// Returns true if all events were sent, false on unrecoverable failure
+bool FlushInputs(std::vector<INPUT>& buffer) {
+    if (buffer.empty()) return true;
+
+    UINT total = static_cast<UINT>(buffer.size());
+    UINT offset = 0;
+    int consecutiveFailures = 0;
+
+    while (offset < total) {
+        UINT remaining = total - offset;
+        UINT sent = SendInput(remaining, buffer.data() + offset, sizeof(INPUT));
+
+        if (sent > 0) {
+            offset += sent;
+            consecutiveFailures = 0;
+        } else {
+            // Complete failure - yield and retry
+            consecutiveFailures++;
+            if (consecutiveFailures >= MAX_RETRY_COUNT) {
+                buffer.clear();
+                return false;
+            }
+            SwitchToThread();  // Yield instead of Sleep for speed
+        }
+    }
+
+    buffer.clear();
+    return true;
+}
+
+// Append character using KEYEVENTF_UNICODE (no modifiers involved)
+void AppendCharacterInputs(std::vector<INPUT>& buffer, wchar_t c) {
+    INPUT down = {};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wScan = c;
+    down.ki.dwFlags = KEYEVENTF_UNICODE;
+    buffer.push_back(down);
+
+    INPUT up = {};
+    up.type = INPUT_KEYBOARD;
+    up.ki.wScan = c;
+    up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+    buffer.push_back(up);
+}
+
+// Append newline using VK_RETURN (VK-only, no scancode needed)
+void AppendNewlineInputs(std::vector<INPUT>& buffer) {
+    INPUT down = {};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wVk = VK_RETURN;
+    buffer.push_back(down);
+
+    INPUT up = {};
+    up.type = INPUT_KEYBOARD;
+    up.ki.wVk = VK_RETURN;
+    up.ki.dwFlags = KEYEVENTF_KEYUP;
+    buffer.push_back(up);
+}
+
+} // namespace inject
+
+// ============================================================================
 // Keyboard Simulation
 // ============================================================================
 
 size_t sendTextToWindow(const std::wstring& text) {
+    // Enable high-resolution timer for precise Sleep() calls
+    inject::TimerResolutionGuard timerGuard;
+
+    // Reset modifiers at start (clean slate)
+    inject::ResetModifiers();
+
+    std::vector<INPUT> buffer;
+    buffer.reserve(CHUNK_SIZE * 2 + 4);
+
+    size_t charsSent = 0;
+    size_t charsInBuffer = 0;
+
     for (size_t i = 0; i < text.size(); ++i) {
-        // Check for ESC key at the start of each iteration
-        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-            return i;  // Return count sent before interrupt
+        // Check for ESC at chunk boundaries
+        if (buffer.empty() && (GetAsyncKeyState(VK_ESCAPE) & 0x8000)) {
+            inject::ResetModifiers();
+            return charsSent;
         }
+
         wchar_t c = text[i];
-        // Handle Windows line endings: skip '\r' if followed by '\n'
+
+        // Skip '\r' in CRLF sequences
         if (c == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') {
             continue;
         }
-        // If newline, send a real Enter key event
+
+        // Handle newlines - flush buffer first, then send newline separately
         if (c == L'\n' || c == L'\r') {
-            INPUT input[2] = {};
-            input[0].type = INPUT_KEYBOARD;
-            input[0].ki.wVk = VK_RETURN;
-            input[0].ki.dwFlags = 0;
+            // Flush any pending characters
+            if (!buffer.empty()) {
+                if (!inject::FlushInputs(buffer)) {
+                    inject::ResetModifiers();
+                    return charsSent;  // Abort on failure
+                }
+                charsSent += charsInBuffer;
+                charsInBuffer = 0;
+            }
 
-            input[1].type = INPUT_KEYBOARD;
-            input[1].ki.wVk = VK_RETURN;
-            input[1].ki.dwFlags = KEYEVENTF_KEYUP;
+            // Send newline
+            inject::AppendNewlineInputs(buffer);
+            if (!inject::FlushInputs(buffer)) {
+                inject::ResetModifiers();
+                return charsSent;  // Abort on failure
+            }
+            charsSent++;
 
-            SendInput(2, input, sizeof(INPUT));
-            Sleep(g_app.keystrokeDelayMs);
-        } else {
-            INPUT input[2] = {};
-            input[0].type = INPUT_KEYBOARD;
-            input[0].ki.wVk = 0;
-            input[0].ki.wScan = c;
-            input[0].ki.dwFlags = KEYEVENTF_UNICODE;
+            // Extra pause after newline (terminals need this)
+            Sleep(NEWLINE_PAUSE_MS);
+            continue;
+        }
 
-            input[1].type = INPUT_KEYBOARD;
-            input[1].ki.wVk = 0;
-            input[1].ki.wScan = c;
-            input[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        // Accumulate character
+        inject::AppendCharacterInputs(buffer, c);
+        charsInBuffer++;
 
-            SendInput(2, input, sizeof(INPUT));
-            Sleep(g_app.keystrokeDelayMs);
+        // Flush at chunk boundary
+        if (charsInBuffer >= CHUNK_SIZE) {
+            if (!inject::FlushInputs(buffer)) {
+                inject::ResetModifiers();
+                return charsSent;  // Abort on failure
+            }
+            charsSent += charsInBuffer;
+            charsInBuffer = 0;
+
+            // Inter-chunk delay (NOT multiplied by chunk size!)
+            // keystrokeDelayMs=0: yield only (fastest)
+            // keystrokeDelayMs=1-3: small pause for fragile targets
+            if (g_app.keystrokeDelayMs > 0) {
+                Sleep(g_app.keystrokeDelayMs);
+            } else {
+                SwitchToThread();  // Yield to let receiver process
+            }
         }
     }
-    return text.size();  // All characters sent
+
+    // Flush remaining
+    if (!buffer.empty()) {
+        if (!inject::FlushInputs(buffer)) {
+            inject::ResetModifiers();
+            return charsSent;
+        }
+        charsSent += charsInBuffer;
+    }
+
+    // Reset modifiers at end
+    inject::ResetModifiers();
+
+    return charsSent;
 }
 
 // ============================================================================
@@ -553,8 +713,26 @@ void ExecutePaste() {
     // Minimize to tray before pasting
     MinimizeToTray();
 
-    // Brief delay to ensure window is hidden and focus transfers
-    Sleep(150);
+    // Wait for focus to stabilize on target window
+    // Requires 3 consecutive checks where a different window has focus
+    HWND hwndSelf = g_app.hwndMain;
+    int stableCount = 0;
+    DWORD startTime = GetTickCount();
+    const DWORD FOCUS_TIMEOUT_MS = 1000;  // Max wait time
+
+    while (stableCount < 3) {
+        Sleep(50);
+        HWND hwndFg = GetForegroundWindow();
+        if (hwndFg != hwndSelf && hwndFg != NULL) {
+            stableCount++;
+        } else {
+            stableCount = 0;
+        }
+        // Timeout check
+        if (GetTickCount() - startTime > FOCUS_TIMEOUT_MS) {
+            break;
+        }
+    }
 
     // Get text content
     std::wstring textContent;
