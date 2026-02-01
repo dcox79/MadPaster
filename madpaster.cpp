@@ -30,14 +30,51 @@ using namespace Gdiplus;
 
 const int maxchar = 45000;
 
-// Input injection constants
-const int CHUNK_SIZE = 16;            // Characters per SendInput batch (small chunks for reliability)
-const int NEWLINE_PAUSE_MS = 10;      // Extra pause after newlines
+// Injection modes for different target types
+enum class InjectionMode {
+    Unicode,    // KEYEVENTF_UNICODE - works for local apps
+    VKScancode, // VK codes with scancodes - better for remote clients
+    Hybrid,     // Try VK first, fall back to Unicode
+    Auto        // Detect target type and choose mode
+};
+
+// Pacing strategies for input injection
+enum class PacingStrategy {
+    Burst,        // Send chunk, pause after - for local targets
+    PerCharacter, // Pause after each complete character - for remote
+    PerEvent      // Pause between every INPUT event - most conservative
+};
+
+// Input injection constants (legacy burst mode)
+const int CHUNK_SIZE = 2;             // Characters per SendInput batch (conservative)
+const int INTER_CHUNK_PAUSE_MS = 25;  // Base pause between chunks
+const int NEWLINE_PAUSE_MS = 100;     // Pause before/after newlines
 const int MAX_RETRY_COUNT = 3;        // Retries on partial SendInput
+const int IDLE_WAIT_MS = 50;          // Max wait for WaitForInputIdle
+
+// Per-event pacing constants (new mode)
+const int PER_EVENT_DELAY_MS = 2;     // Delay between each INPUT event
+const int PER_CHAR_DELAY_MS = 5;      // Delay after each complete character
+const int LINE_START_GUARD_CHARS = 3; // Extra delay for first N chars after newline
+const int LINE_START_GUARD_MS = 10;   // Extra delay per guard char
+
+// Remote client window classes (null-terminated array)
+const wchar_t* REMOTE_WINDOW_CLASSES[] = {
+    L"TscShellContainerClass",  // mstsc.exe (RDP)
+    L"ICAClientClass",          // Citrix Receiver
+    L"RAIL_WINDOW",             // Citrix seamless apps
+    L"Transparent Windows Client", // Azure Virtual Desktop
+    L"vncviewer",               // VNC clients
+    L"TightVNC",
+    L"RealVNC",
+    L"MozillaWindowClass",      // Firefox (noVNC)
+    L"Chrome_WidgetWin_1",      // Chrome/Edge (noVNC, Azure Bastion)
+    nullptr
+};
 
 // Window dimensions
 const int WINDOW_WIDTH = 400;
-const int WINDOW_HEIGHT = 320;
+const int WINDOW_HEIGHT = 390;
 
 // Control IDs
 #define IDC_RADIO_CLIPBOARD     101
@@ -50,6 +87,8 @@ const int WINDOW_HEIGHT = 320;
 #define IDC_STATIC_STATUS       108
 #define IDC_EDIT_KEYSTROKE      109
 #define IDC_SPIN_KEYSTROKE      110
+#define IDC_COMBO_MODE          111
+#define IDC_CHECK_DIAG          112
 
 // Timer IDs
 #define IDT_COUNTDOWN           201
@@ -79,6 +118,8 @@ struct AppState {
     HWND hwndSpinDelay;
     HWND hwndEditKeystroke;
     HWND hwndSpinKeystroke;
+    HWND hwndComboMode;
+    HWND hwndCheckDiag;
     HWND hwndButtonArm;
     HWND hwndButtonBrowse;
     HWND hwndStaticFilePath;
@@ -109,6 +150,10 @@ struct AppState {
     // Countdown state
     bool isArmed;
     int countdownRemaining;
+
+    // Injection settings
+    InjectionMode injectionMode;
+    bool diagnosticMode;
 };
 
 static AppState g_app = {};
@@ -367,6 +412,52 @@ struct TimerResolutionGuard {
     ~TimerResolutionGuard() { timeEndPeriod(1); }
 };
 
+// Information about detected remote client
+struct RemoteClientInfo {
+    bool isRemote;
+    wchar_t className[256];
+    HWND hwnd;
+    DWORD threadId;
+    DWORD processId;
+    HKL keyboardLayout;
+};
+
+// Check if window class is a known remote client
+bool IsKnownRemoteClass(const wchar_t* className) {
+    if (!className || !className[0]) return false;
+
+    for (int i = 0; REMOTE_WINDOW_CLASSES[i] != nullptr; i++) {
+        if (_wcsicmp(className, REMOTE_WINDOW_CLASSES[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Detect if foreground window is a remote client
+RemoteClientInfo DetectRemoteClient() {
+    RemoteClientInfo info = {};
+    info.hwnd = GetForegroundWindow();
+
+    if (!info.hwnd) {
+        return info;
+    }
+
+    // Get window class name
+    GetClassNameW(info.hwnd, info.className, 256);
+
+    // Get thread/process info
+    info.threadId = GetWindowThreadProcessId(info.hwnd, &info.processId);
+
+    // Get keyboard layout for VK mapping
+    info.keyboardLayout = GetKeyboardLayout(info.threadId);
+
+    // Check if this is a known remote class
+    info.isRemote = IsKnownRemoteClass(info.className);
+
+    return info;
+}
+
 // Send modifier reset fence - releases all modifier keys
 void ResetModifiers() {
     INPUT inputs[6] = {};
@@ -398,9 +489,141 @@ void ResetModifiers() {
     SendInput(6, inputs, sizeof(INPUT));
 }
 
+// Forward declaration
+void AppendCharacterInputs(std::vector<INPUT>& buffer, wchar_t c);
+
+// VK/Scancode mapping result
+struct VKMapping {
+    bool success;
+    BYTE vk;
+    WORD scancode;
+    bool needsShift;
+};
+
+// Map a character to VK code using VkKeyScanExW
+// Only accepts "safe" mappings that require no modifiers or just Shift
+// Rejects mappings that need Ctrl/Alt (would trigger shortcuts)
+VKMapping MapCharacterToVK(wchar_t ch, HKL layout) {
+    VKMapping result = {};
+
+    SHORT vkResult = VkKeyScanExW(ch, layout);
+    if (vkResult == -1) {
+        // Character cannot be mapped to a VK code
+        return result;
+    }
+
+    BYTE vk = LOBYTE(vkResult);
+    BYTE modifiers = HIBYTE(vkResult);
+
+    // Only accept no modifiers (0) or Shift only (1)
+    // Reject Ctrl (2), Alt (4), or combinations
+    if (modifiers > 1) {
+        return result;
+    }
+
+    result.success = true;
+    result.vk = vk;
+    result.needsShift = (modifiers == 1);
+
+    // Get hardware scancode for VK
+    result.scancode = static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+
+    return result;
+}
+
+// Append character using VK code with scancode
+// Returns number of INPUT events added (2 for simple char, 4 with Shift)
+int AppendVKCharacterInputs(std::vector<INPUT>& buffer, wchar_t ch, HKL layout) {
+    VKMapping mapping = MapCharacterToVK(ch, layout);
+    if (!mapping.success) {
+        return 0;  // Caller should fall back to Unicode
+    }
+
+    int eventsAdded = 0;
+
+    // Press Shift if needed
+    if (mapping.needsShift) {
+        INPUT shiftDown = {};
+        shiftDown.type = INPUT_KEYBOARD;
+        shiftDown.ki.wVk = VK_SHIFT;
+        shiftDown.ki.wScan = static_cast<WORD>(MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC));
+        shiftDown.ki.dwFlags = KEYEVENTF_SCANCODE;
+        buffer.push_back(shiftDown);
+        eventsAdded++;
+    }
+
+    // Key down
+    INPUT down = {};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wVk = mapping.vk;
+    down.ki.wScan = mapping.scancode;
+    down.ki.dwFlags = KEYEVENTF_SCANCODE;
+    buffer.push_back(down);
+    eventsAdded++;
+
+    // Key up
+    INPUT up = {};
+    up.type = INPUT_KEYBOARD;
+    up.ki.wVk = mapping.vk;
+    up.ki.wScan = mapping.scancode;
+    up.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+    buffer.push_back(up);
+    eventsAdded++;
+
+    // Release Shift if pressed
+    if (mapping.needsShift) {
+        INPUT shiftUp = {};
+        shiftUp.type = INPUT_KEYBOARD;
+        shiftUp.ki.wVk = VK_SHIFT;
+        shiftUp.ki.wScan = static_cast<WORD>(MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC));
+        shiftUp.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+        buffer.push_back(shiftUp);
+        eventsAdded++;
+    }
+
+    return eventsAdded;
+}
+
+// Append character using appropriate mode
+// Returns true if character was added, false if skipped (should not happen)
+bool AppendCharacterWithMode(std::vector<INPUT>& buffer, wchar_t ch,
+                             InjectionMode mode, HKL layout) {
+    switch (mode) {
+        case InjectionMode::Unicode:
+            AppendCharacterInputs(buffer, ch);
+            return true;
+
+        case InjectionMode::VKScancode: {
+            int added = AppendVKCharacterInputs(buffer, ch, layout);
+            if (added == 0) {
+                // VK mapping failed - fall back to Unicode as last resort
+                AppendCharacterInputs(buffer, ch);
+            }
+            return true;
+        }
+
+        case InjectionMode::Hybrid: {
+            // Try VK first, fall back to Unicode
+            int added = AppendVKCharacterInputs(buffer, ch, layout);
+            if (added == 0) {
+                AppendCharacterInputs(buffer, ch);
+            }
+            return true;
+        }
+
+        case InjectionMode::Auto:
+        default:
+            // Auto mode should be resolved before calling this
+            // Default to Unicode
+            AppendCharacterInputs(buffer, ch);
+            return true;
+    }
+}
+
 // Flush accumulated INPUT events - loops until ALL events are sent
 // Returns true if all events were sent, false on unrecoverable failure
-bool FlushInputs(std::vector<INPUT>& buffer) {
+// Optional eventsSent pointer to track total events successfully sent
+bool FlushInputs(std::vector<INPUT>& buffer, size_t* eventsSent = nullptr) {
     if (buffer.empty()) return true;
 
     UINT total = static_cast<UINT>(buffer.size());
@@ -413,6 +636,7 @@ bool FlushInputs(std::vector<INPUT>& buffer) {
 
         if (sent > 0) {
             offset += sent;
+            if (eventsSent) *eventsSent += sent;
             consecutiveFailures = 0;
         } else {
             // Complete failure - yield and retry
@@ -421,12 +645,77 @@ bool FlushInputs(std::vector<INPUT>& buffer) {
                 buffer.clear();
                 return false;
             }
-            SwitchToThread();  // Yield instead of Sleep for speed
+            Sleep(1);  // Real yield - allows target to drain input queue
         }
     }
 
     buffer.clear();
     return true;
+}
+
+// Forward declarations for pacing
+struct DiagnosticState;
+
+// Pacing configuration for injection
+struct PacingConfig {
+    PacingStrategy strategy;
+    int perEventDelayMs;
+    int perCharDelayMs;
+    int lineStartGuardChars;
+    int lineStartGuardMs;
+    int baseKeystrokeDelayMs;  // From UI setting
+};
+
+// Get default pacing config based on target type
+PacingConfig GetDefaultPacingConfig(bool isRemote) {
+    PacingConfig config = {};
+    config.perEventDelayMs = PER_EVENT_DELAY_MS;
+    config.perCharDelayMs = PER_CHAR_DELAY_MS;
+    config.lineStartGuardChars = LINE_START_GUARD_CHARS;
+    config.lineStartGuardMs = LINE_START_GUARD_MS;
+    config.baseKeystrokeDelayMs = g_app.keystrokeDelayMs;
+
+    if (isRemote) {
+        config.strategy = PacingStrategy::PerCharacter;
+    } else {
+        config.strategy = PacingStrategy::Burst;
+    }
+
+    return config;
+}
+
+// Flush with per-event pacing - sends events one at a time with delays
+// Returns number of events successfully sent
+size_t FlushInputsWithPacing(std::vector<INPUT>& buffer, const PacingConfig& config,
+                             DiagnosticState* diag) {
+    if (buffer.empty()) return 0;
+
+    size_t sent = 0;
+    int consecutiveFailures = 0;
+
+    for (size_t i = 0; i < buffer.size(); i++) {
+        UINT result = SendInput(1, &buffer[i], sizeof(INPUT));
+
+        if (result > 0) {
+            sent++;
+            consecutiveFailures = 0;
+
+            // Per-event delay
+            if (config.strategy == PacingStrategy::PerEvent && config.perEventDelayMs > 0) {
+                Sleep(config.perEventDelayMs);
+            }
+        } else {
+            consecutiveFailures++;
+            if (consecutiveFailures >= MAX_RETRY_COUNT) {
+                break;  // Abort on repeated failures
+            }
+            Sleep(1);
+            i--;  // Retry this event
+        }
+    }
+
+    buffer.clear();
+    return sent;
 }
 
 // Append character using KEYEVENTF_UNICODE (no modifiers involved)
@@ -444,18 +733,239 @@ void AppendCharacterInputs(std::vector<INPUT>& buffer, wchar_t c) {
     buffer.push_back(up);
 }
 
-// Append newline using VK_RETURN (VK-only, no scancode needed)
-void AppendNewlineInputs(std::vector<INPUT>& buffer) {
-    INPUT down = {};
-    down.type = INPUT_KEYBOARD;
-    down.ki.wVk = VK_RETURN;
-    buffer.push_back(down);
+// Send Enter key using hardware scancode for maximum compatibility
+// Unicode CR/LF doesn't create line breaks in Scintilla-based editors
+// Using KEYEVENTF_SCANCODE forces hardware-level input that Scintilla handles correctly
+void SendEnterKey() {
+    INPUT inputs[2] = {};
 
-    INPUT up = {};
-    up.type = INPUT_KEYBOARD;
-    up.ki.wVk = VK_RETURN;
-    up.ki.dwFlags = KEYEVENTF_KEYUP;
-    buffer.push_back(up);
+    // Key down - use scancode mode for hardware-level simulation
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = 0;       // Must be 0 when using KEYEVENTF_SCANCODE
+    inputs[0].ki.wScan = 0x1C;  // Hardware scan code for Enter key
+    inputs[0].ki.dwFlags = KEYEVENTF_SCANCODE;
+
+    // Key up
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 0;
+    inputs[1].ki.wScan = 0x1C;
+    inputs[1].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+
+    // Send both events atomically
+    SendInput(2, inputs, sizeof(INPUT));
+}
+
+// Drain the input queue by yielding CPU time repeatedly
+// This ensures the target app has time to process pending input before we continue
+void DrainInputQueue() {
+    // Multiple yields with longer sleeps to let the target process its message queue
+    // SwitchToThread yields to any ready thread, Sleep(1) allows scheduler to run others
+    for (int i = 0; i < 5; i++) {
+        SwitchToThread();
+        Sleep(2);
+    }
+}
+
+// Get process ID of foreground window
+DWORD GetForegroundProcessId() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid;
+}
+
+// Wait for target process to become idle (finished processing input)
+// Returns true if idle or on error, false on timeout
+bool WaitForTargetIdle(DWORD pid, DWORD maxWaitMs) {
+    if (pid == 0) return true;
+
+    HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!hProcess) return true;  // Can't open = assume ready
+
+    DWORD result = WaitForInputIdle(hProcess, maxWaitMs);
+    CloseHandle(hProcess);
+
+    // 0 = success (idle), WAIT_TIMEOUT = timeout, WAIT_FAILED = error
+    return (result != WAIT_TIMEOUT);
+}
+
+// Diagnostic state for injection debugging
+struct DiagnosticState {
+    size_t totalEventsAttempted;
+    size_t totalEventsSent;
+    size_t totalEventsFailed;
+    size_t totalCharsSent;
+    size_t totalCharsRequested;
+    std::vector<std::pair<DWORD, std::wstring>> foregroundChanges;
+    std::vector<std::wstring> errors;
+    DWORD startTime;
+    DWORD endTime;
+
+    // Context info
+    std::wstring injectionModeName;
+    std::wstring targetClassName;
+    bool targetIsRemote;
+
+    DiagnosticState() : totalEventsAttempted(0), totalEventsSent(0),
+                        totalEventsFailed(0), totalCharsSent(0),
+                        totalCharsRequested(0), startTime(0), endTime(0),
+                        targetIsRemote(false) {}
+
+    void RecordForegroundChange(HWND hwnd) {
+        wchar_t className[256] = {};
+        if (hwnd) GetClassNameW(hwnd, className, 256);
+        foregroundChanges.push_back({GetTickCount(), className});
+    }
+
+    void RecordError(const std::wstring& error) {
+        errors.push_back(error);
+    }
+
+    std::wstring GetSummary(bool forMessageBox = false) {
+        std::wstring summary;
+        std::wstring nl = forMessageBox ? L"\n" : L"\r\n";
+
+        if (!forMessageBox) {
+            // Add timestamp for log file
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            wchar_t timestamp[64];
+            swprintf_s(timestamp, L"[%04d-%02d-%02d %02d:%02d:%02d]",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+            summary += timestamp;
+            summary += nl;
+        }
+
+        summary += L"MadPaster Injection Report" + nl;
+        summary += L"─────────────────────────────" + nl;
+
+        // Target info
+        summary += L"Target: " + targetClassName;
+        if (targetIsRemote) summary += L" (Remote)";
+        summary += nl;
+
+        summary += L"Mode: " + injectionModeName + nl;
+        summary += nl;
+
+        // Results
+        summary += L"Characters: " + std::to_wstring(totalCharsSent) + L" / " +
+                   std::to_wstring(totalCharsRequested);
+        if (totalCharsSent == totalCharsRequested) {
+            summary += L" ✓";
+        } else {
+            summary += L" (incomplete)";
+        }
+        summary += nl;
+
+        summary += L"Events: " + std::to_wstring(totalEventsSent) + L" / " +
+                   std::to_wstring(totalEventsAttempted) + L" sent" + nl;
+
+        DWORD duration = endTime - startTime;
+        summary += L"Duration: " + std::to_wstring(duration) + L" ms";
+        if (duration > 0 && totalCharsSent > 0) {
+            double cps = (double)totalCharsSent * 1000.0 / (double)duration;
+            wchar_t cpsStr[32];
+            swprintf_s(cpsStr, L" (%.1f chars/sec)", cps);
+            summary += cpsStr;
+        }
+        summary += nl;
+
+        // Issues
+        if (!foregroundChanges.empty() || !errors.empty()) {
+            summary += nl + L"Issues:" + nl;
+            if (!foregroundChanges.empty()) {
+                summary += L"  • Focus changed " + std::to_wstring(foregroundChanges.size()) +
+                           L" time(s) during injection" + nl;
+            }
+            for (const auto& err : errors) {
+                summary += L"  • " + err + nl;
+            }
+        }
+
+        return summary;
+    }
+};
+
+// Optional keyboard hook for diagnostic verification
+// Counts how many injected events actually reach the system
+static HHOOK g_diagHook = nullptr;
+static volatile LONG g_hookEventCount = 0;
+
+LRESULT CALLBACK DiagnosticKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0) {
+        KBDLLHOOKSTRUCT* pKbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        // Count injected events (LLKHF_INJECTED flag)
+        if (pKbd->flags & LLKHF_INJECTED) {
+            InterlockedIncrement(&g_hookEventCount);
+        }
+    }
+    return CallNextHookEx(g_diagHook, nCode, wParam, lParam);
+}
+
+bool InstallDiagnosticHook() {
+    if (g_diagHook) return true;  // Already installed
+
+    g_hookEventCount = 0;
+    g_diagHook = SetWindowsHookExW(WH_KEYBOARD_LL, DiagnosticKeyboardProc,
+                                    GetModuleHandleW(nullptr), 0);
+    return (g_diagHook != nullptr);
+}
+
+void RemoveDiagnosticHook() {
+    if (g_diagHook) {
+        UnhookWindowsHookEx(g_diagHook);
+        g_diagHook = nullptr;
+    }
+}
+
+size_t GetHookEventCount() {
+    return static_cast<size_t>(InterlockedExchangeAdd(&g_hookEventCount, 0));
+}
+
+void ResetHookEventCount() {
+    InterlockedExchange(&g_hookEventCount, 0);
+}
+
+// Low-level keyboard hook for abort detection
+// Intercepts ESC at system level, works even when Citrix/RDP has focus
+static HHOOK g_abortHook = nullptr;
+static volatile LONG g_abortRequested = 0;
+
+LRESULT CALLBACK AbortKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+        KBDLLHOOKSTRUCT* pKbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        // Check for ESC key (not injected by us)
+        if (pKbd->vkCode == VK_ESCAPE && !(pKbd->flags & LLKHF_INJECTED)) {
+            InterlockedExchange(&g_abortRequested, 1);
+        }
+    }
+    return CallNextHookEx(g_abortHook, nCode, wParam, lParam);
+}
+
+bool InstallAbortHook() {
+    if (g_abortHook) return true;  // Already installed
+
+    g_abortRequested = 0;
+    g_abortHook = SetWindowsHookExW(WH_KEYBOARD_LL, AbortKeyboardProc,
+                                     GetModuleHandleW(nullptr), 0);
+    return (g_abortHook != nullptr);
+}
+
+void RemoveAbortHook() {
+    if (g_abortHook) {
+        UnhookWindowsHookEx(g_abortHook);
+        g_abortHook = nullptr;
+    }
+    g_abortRequested = 0;
+}
+
+bool IsAbortRequested() {
+    return (InterlockedExchangeAdd(&g_abortRequested, 0) != 0);
+}
+
+void ResetAbortFlag() {
+    InterlockedExchange(&g_abortRequested, 0);
 }
 
 } // namespace inject
@@ -464,23 +974,50 @@ void AppendNewlineInputs(std::vector<INPUT>& buffer) {
 // Keyboard Simulation
 // ============================================================================
 
-size_t sendTextToWindow(const std::wstring& text) {
+// Extended injection function with mode and pacing configuration
+size_t sendTextToWindowEx(const std::wstring& text, InjectionMode mode,
+                          const inject::PacingConfig& config,
+                          inject::DiagnosticState* diag) {
     // Enable high-resolution timer for precise Sleep() calls
     inject::TimerResolutionGuard timerGuard;
+
+    // Install low-level keyboard hook for ESC detection (works even in Citrix/RDP)
+    inject::InstallAbortHook();
+
+    if (diag) {
+        diag->startTime = GetTickCount();
+    }
+
+    // Detect remote client for keyboard layout
+    inject::RemoteClientInfo clientInfo = inject::DetectRemoteClient();
+    HKL layout = clientInfo.keyboardLayout;
+
+    // Resolve Auto mode - default to Hybrid for best compatibility with remote sessions
+    InjectionMode resolvedMode = mode;
+    if (mode == InjectionMode::Auto) {
+        resolvedMode = InjectionMode::Hybrid;
+    }
 
     // Reset modifiers at start (clean slate)
     inject::ResetModifiers();
 
     std::vector<INPUT> buffer;
-    buffer.reserve(CHUNK_SIZE * 2 + 4);
+    buffer.reserve(16);  // Larger for VK mode with shift events
 
     size_t charsSent = 0;
     size_t charsInBuffer = 0;
+    size_t charsSinceNewline = 0;  // For line-start guard
 
     for (size_t i = 0; i < text.size(); ++i) {
-        // Check for ESC at chunk boundaries
-        if (buffer.empty() && (GetAsyncKeyState(VK_ESCAPE) & 0x8000)) {
+        // Check for ESC at chunk boundaries (using low-level hook for Citrix/RDP compatibility)
+        if (buffer.empty() && inject::IsAbortRequested()) {
             inject::ResetModifiers();
+            inject::RemoveAbortHook();
+            if (diag) {
+                diag->endTime = GetTickCount();
+                diag->totalCharsSent = charsSent;
+                diag->RecordError(L"User cancelled with ESC");
+            }
             return charsSent;
         }
 
@@ -491,68 +1028,200 @@ size_t sendTextToWindow(const std::wstring& text) {
             continue;
         }
 
-        // Handle newlines - flush buffer first, then send newline separately
+        // Handle newlines
         if (c == L'\n' || c == L'\r') {
             // Flush any pending characters
             if (!buffer.empty()) {
-                if (!inject::FlushInputs(buffer)) {
-                    inject::ResetModifiers();
-                    return charsSent;  // Abort on failure
+                if (diag) diag->totalEventsAttempted += buffer.size();
+
+                if (config.strategy == PacingStrategy::Burst) {
+                    if (!inject::FlushInputs(buffer, diag ? &diag->totalEventsSent : nullptr)) {
+                        inject::ResetModifiers();
+                        inject::RemoveAbortHook();
+                        if (diag) {
+                            diag->endTime = GetTickCount();
+                            diag->totalCharsSent = charsSent;
+                            diag->RecordError(L"FlushInputs failed before newline");
+                        }
+                        return charsSent;
+                    }
+                } else {
+                    size_t sent = inject::FlushInputsWithPacing(buffer, config, diag);
+                    if (diag) diag->totalEventsSent += sent;
                 }
                 charsSent += charsInBuffer;
                 charsInBuffer = 0;
             }
 
-            // Send newline
-            inject::AppendNewlineInputs(buffer);
-            if (!inject::FlushInputs(buffer)) {
-                inject::ResetModifiers();
-                return charsSent;  // Abort on failure
-            }
-            charsSent++;
+            // Normalized newline handling - single unified pause
+            inject::DrainInputQueue();
+            Sleep(config.baseKeystrokeDelayMs + NEWLINE_PAUSE_MS / 2);
 
-            // Extra pause after newline (terminals need this)
-            Sleep(NEWLINE_PAUSE_MS);
+            // Send Enter key
+            inject::SendEnterKey();
+            charsSent++;
+            charsSinceNewline = 0;  // Reset line-start counter
+
+            // Brief pause after enter
+            Sleep(config.baseKeystrokeDelayMs + NEWLINE_PAUSE_MS / 2);
+            inject::DrainInputQueue();
             continue;
         }
 
-        // Accumulate character
-        inject::AppendCharacterInputs(buffer, c);
+        // Accumulate character using appropriate mode
+        size_t bufferSizeBefore = buffer.size();
+        inject::AppendCharacterWithMode(buffer, c, resolvedMode, layout);
         charsInBuffer++;
+        charsSinceNewline++;
+
+        // Determine chunk size based on pacing strategy
+        int effectiveChunkSize = (config.strategy == PacingStrategy::Burst) ? CHUNK_SIZE : 1;
 
         // Flush at chunk boundary
-        if (charsInBuffer >= CHUNK_SIZE) {
-            if (!inject::FlushInputs(buffer)) {
-                inject::ResetModifiers();
-                return charsSent;  // Abort on failure
+        if (charsInBuffer >= static_cast<size_t>(effectiveChunkSize)) {
+            if (diag) diag->totalEventsAttempted += buffer.size();
+
+            if (config.strategy == PacingStrategy::Burst) {
+                if (!inject::FlushInputs(buffer, diag ? &diag->totalEventsSent : nullptr)) {
+                    inject::ResetModifiers();
+                    inject::RemoveAbortHook();
+                    if (diag) {
+                        diag->endTime = GetTickCount();
+                        diag->totalCharsSent = charsSent;
+                        diag->RecordError(L"FlushInputs failed");
+                    }
+                    return charsSent;
+                }
+            } else {
+                size_t sent = inject::FlushInputsWithPacing(buffer, config, diag);
+                if (diag) diag->totalEventsSent += sent;
             }
+
             charsSent += charsInBuffer;
             charsInBuffer = 0;
 
-            // Inter-chunk delay (NOT multiplied by chunk size!)
-            // keystrokeDelayMs=0: yield only (fastest)
-            // keystrokeDelayMs=1-3: small pause for fragile targets
-            if (g_app.keystrokeDelayMs > 0) {
-                Sleep(g_app.keystrokeDelayMs);
-            } else {
-                SwitchToThread();  // Yield to let receiver process
+            // Calculate pause
+            int pauseMs = config.baseKeystrokeDelayMs;
+
+            if (config.strategy == PacingStrategy::Burst) {
+                pauseMs += INTER_CHUNK_PAUSE_MS;
+            } else if (config.strategy == PacingStrategy::PerCharacter) {
+                pauseMs += config.perCharDelayMs;
+            }
+
+            // Line-start guard: extra delay for first few chars after newline
+            if (charsSinceNewline <= static_cast<size_t>(config.lineStartGuardChars)) {
+                pauseMs += config.lineStartGuardMs;
+            }
+
+            if (pauseMs > 0) {
+                Sleep(pauseMs);
+            }
+
+            if (config.strategy == PacingStrategy::Burst) {
+                inject::DrainInputQueue();
             }
         }
     }
 
     // Flush remaining
     if (!buffer.empty()) {
-        if (!inject::FlushInputs(buffer)) {
-            inject::ResetModifiers();
-            return charsSent;
+        if (diag) diag->totalEventsAttempted += buffer.size();
+
+        if (config.strategy == PacingStrategy::Burst) {
+            if (!inject::FlushInputs(buffer, diag ? &diag->totalEventsSent : nullptr)) {
+                inject::ResetModifiers();
+                inject::RemoveAbortHook();
+                if (diag) {
+                    diag->endTime = GetTickCount();
+                    diag->totalCharsSent = charsSent;
+                    diag->RecordError(L"FlushInputs failed at end");
+                }
+                return charsSent;
+            }
+        } else {
+            size_t sent = inject::FlushInputsWithPacing(buffer, config, diag);
+            if (diag) diag->totalEventsSent += sent;
         }
         charsSent += charsInBuffer;
     }
 
     // Reset modifiers at end
     inject::ResetModifiers();
+    inject::RemoveAbortHook();
+
+    if (diag) {
+        diag->endTime = GetTickCount();
+        diag->totalCharsSent = charsSent;
+    }
 
     return charsSent;
+}
+
+// Forward declarations for diagnostic logging
+std::wstring GetLogPath();
+void WriteDiagnosticLog(const std::wstring& content);
+
+// Original function - wrapper that auto-detects target and selects mode
+size_t sendTextToWindow(const std::wstring& text) {
+    // Detect remote client
+    inject::RemoteClientInfo clientInfo = inject::DetectRemoteClient();
+
+    // Get appropriate pacing config
+    inject::PacingConfig config = inject::GetDefaultPacingConfig(clientInfo.isRemote);
+
+    // Optional diagnostic state when enabled
+    inject::DiagnosticState* diag = nullptr;
+    inject::DiagnosticState diagState;
+    if (g_app.diagnosticMode) {
+        diag = &diagState;
+
+        // Populate context info
+        diag->totalCharsRequested = text.length();
+        diag->targetClassName = clientInfo.className;
+        diag->targetIsRemote = clientInfo.isRemote;
+
+        // Set injection mode name
+        InjectionMode effectiveMode = g_app.injectionMode;
+        if (effectiveMode == InjectionMode::Auto) {
+            effectiveMode = clientInfo.isRemote ? InjectionMode::Hybrid : InjectionMode::Unicode;
+            diag->injectionModeName = L"Auto → ";
+        }
+        switch (effectiveMode) {
+            case InjectionMode::Unicode:
+                diag->injectionModeName += L"Unicode";
+                break;
+            case InjectionMode::VKScancode:
+                diag->injectionModeName += L"VK Scancode";
+                break;
+            case InjectionMode::Hybrid:
+                diag->injectionModeName += L"Hybrid";
+                break;
+            default:
+                diag->injectionModeName += L"Auto";
+                break;
+        }
+    }
+
+    // Use configured injection mode (default: Auto)
+    InjectionMode mode = g_app.injectionMode;
+
+    size_t result = sendTextToWindowEx(text, mode, config, diag);
+
+    // Log and display diagnostics if enabled
+    if (diag) {
+        // Write to debug output (for DebugView)
+        OutputDebugStringW(diag->GetSummary().c_str());
+
+        // Write to log file
+        WriteDiagnosticLog(diag->GetSummary(false));
+
+        // Show message box (use topmost so it appears over other windows)
+        MessageBoxW(nullptr, diag->GetSummary(true).c_str(),
+                    L"MadPaster - Injection Diagnostics", MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+    }
+
+    return result;
 }
 
 // ============================================================================
@@ -573,6 +1242,75 @@ std::wstring GetIniPath() {
     return iniPath;
 }
 
+std::wstring GetLogPath() {
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+    std::wstring logPath(exePath);
+    size_t pos = logPath.rfind(L".exe");
+    if (pos != std::wstring::npos) {
+        logPath.replace(pos, 4, L"-diag.log");
+    } else {
+        logPath += L"-diag.log";
+    }
+    return logPath;
+}
+
+void WriteDiagnosticLog(const std::wstring& content) {
+    std::wstring logPath = GetLogPath();
+
+    // Open file for append (create if doesn't exist)
+    HANDLE hFile = CreateFileW(
+        logPath.c_str(),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return;  // Silently fail if can't write log
+    }
+
+    // Convert to UTF-8 for file
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (utf8Len > 0) {
+        std::vector<char> utf8Buffer(utf8Len);
+        WideCharToMultiByte(CP_UTF8, 0, content.c_str(), -1, utf8Buffer.data(), utf8Len, nullptr, nullptr);
+
+        // Write without null terminator, add separator
+        DWORD bytesWritten;
+        WriteFile(hFile, utf8Buffer.data(), utf8Len - 1, &bytesWritten, nullptr);
+
+        // Use ASCII separator to avoid UTF-8 encoding issues
+        const char* separator = "\r\n========================================\r\n\r\n";
+        WriteFile(hFile, separator, (DWORD)strlen(separator), &bytesWritten, nullptr);
+    }
+
+    CloseHandle(hFile);
+}
+
+// Convert string to InjectionMode enum
+InjectionMode ParseInjectionMode(const wchar_t* str) {
+    if (_wcsicmp(str, L"unicode") == 0) return InjectionMode::Unicode;
+    if (_wcsicmp(str, L"vk") == 0) return InjectionMode::VKScancode;
+    if (_wcsicmp(str, L"hybrid") == 0) return InjectionMode::Hybrid;
+    return InjectionMode::Auto;
+}
+
+// Convert InjectionMode to string
+const wchar_t* InjectionModeToString(InjectionMode mode) {
+    switch (mode) {
+        case InjectionMode::Unicode: return L"unicode";
+        case InjectionMode::VKScancode: return L"vk";
+        case InjectionMode::Hybrid: return L"hybrid";
+        case InjectionMode::Auto:
+        default: return L"auto";
+    }
+}
+
 void LoadSettings() {
     std::wstring iniPath = GetIniPath();
 
@@ -591,6 +1329,14 @@ void LoadSettings() {
     wchar_t filePath[MAX_PATH];
     GetPrivateProfileStringW(L"Settings", L"LastFilePath", L"", filePath, MAX_PATH, iniPath.c_str());
     g_app.selectedFilePath = filePath;
+
+    // Load injection mode
+    wchar_t injMode[32];
+    GetPrivateProfileStringW(L"Settings", L"InjectionMode", L"auto", injMode, 32, iniPath.c_str());
+    g_app.injectionMode = ParseInjectionMode(injMode);
+
+    // Diagnostic mode (default off, usually set via CLI)
+    g_app.diagnosticMode = (GetPrivateProfileIntW(L"Settings", L"DiagnosticMode", 0, iniPath.c_str()) != 0);
 }
 
 void SaveSettings() {
@@ -604,6 +1350,10 @@ void SaveSettings() {
         g_app.useClipboard ? L"clipboard" : L"file", iniPath.c_str());
     WritePrivateProfileStringW(L"Settings", L"LastFilePath",
         g_app.selectedFilePath.c_str(), iniPath.c_str());
+    WritePrivateProfileStringW(L"Settings", L"InjectionMode",
+        InjectionModeToString(g_app.injectionMode), iniPath.c_str());
+    WritePrivateProfileStringW(L"Settings", L"DiagnosticMode",
+        g_app.diagnosticMode ? L"1" : L"0", iniPath.c_str());
 }
 
 // ============================================================================
@@ -701,6 +1451,8 @@ void ResetArmState() {
     EnableWindow(g_app.hwndSpinDelay, TRUE);
     EnableWindow(g_app.hwndEditKeystroke, TRUE);
     EnableWindow(g_app.hwndSpinKeystroke, TRUE);
+    EnableWindow(g_app.hwndComboMode, TRUE);
+    EnableWindow(g_app.hwndCheckDiag, TRUE);
 
     UpdateArmButtonText();
     UpdateStatus(L"Ready - ARM Starts MadPaster  ESC Interrupts MadPaster");
@@ -825,6 +1577,8 @@ void StartArmCountdown() {
     EnableWindow(g_app.hwndSpinDelay, FALSE);
     EnableWindow(g_app.hwndEditKeystroke, FALSE);
     EnableWindow(g_app.hwndSpinKeystroke, FALSE);
+    EnableWindow(g_app.hwndComboMode, FALSE);
+    EnableWindow(g_app.hwndCheckDiag, FALSE);
 
     if (g_app.delaySeconds > 0) {
         UpdateArmButtonText();
@@ -985,15 +1739,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessageW(g_app.hwndSpinKeystroke, UDM_SETBUDDY, (WPARAM)g_app.hwndEditKeystroke, 0);
             SendMessageW(g_app.hwndSpinKeystroke, UDM_SETRANGE32, 0, 100);
 
+            // Injection mode label
+            HWND hwndModeLabel = CreateWindowW(L"STATIC", L"Injection Mode:",
+                WS_CHILD | WS_VISIBLE,
+                24, 197, 110, 20, hwnd, NULL, hInst, NULL);
+            SendMessageW(hwndModeLabel, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
+
+            // Injection mode combo box
+            g_app.hwndComboMode = CreateWindowW(L"COMBOBOX", NULL,
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                140, 194, 95, 120, hwnd, (HMENU)IDC_COMBO_MODE, hInst, NULL);
+            SendMessageW(g_app.hwndComboMode, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
+            SendMessageW(g_app.hwndComboMode, CB_ADDSTRING, 0, (LPARAM)L"Auto");
+            SendMessageW(g_app.hwndComboMode, CB_ADDSTRING, 0, (LPARAM)L"Unicode");
+            SendMessageW(g_app.hwndComboMode, CB_ADDSTRING, 0, (LPARAM)L"VK Scancode");
+            SendMessageW(g_app.hwndComboMode, CB_ADDSTRING, 0, (LPARAM)L"Hybrid");
+
+            // Diagnostic mode checkbox
+            g_app.hwndCheckDiag = CreateWindowW(L"BUTTON", L"Diagnostics",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                250, 196, 110, 20, hwnd, (HMENU)IDC_CHECK_DIAG, hInst, NULL);
+            SendMessageW(g_app.hwndCheckDiag, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
+
             // ARM button (large, prominent, owner-drawn)
             g_app.hwndButtonArm = CreateWindowW(L"BUTTON", L"ARM",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                24, 190, 352, 50, hwnd, (HMENU)IDC_BUTTON_ARM, hInst, NULL);
+                24, 230, 352, 50, hwnd, (HMENU)IDC_BUTTON_ARM, hInst, NULL);
 
             // Status label
             g_app.hwndStaticStatus = CreateWindowW(L"STATIC", L"Status: Ready - ARM Starts MadPaster  ESC Interrupts MadPaster",
                 WS_CHILD | WS_VISIBLE,
-                24, 255, 352, 20, hwnd, (HMENU)IDC_STATIC_STATUS, hInst, NULL);
+                24, 295, 352, 20, hwnd, (HMENU)IDC_STATIC_STATUS, hInst, NULL);
             SendMessageW(g_app.hwndStaticStatus, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
 
             // Apply saved settings to controls
@@ -1006,6 +1782,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!g_app.selectedFilePath.empty()) {
                 SetWindowTextW(g_app.hwndStaticFilePath, g_app.selectedFilePath.c_str());
             }
+
+            // Apply injection mode setting to combo box
+            int modeIndex = 0;  // Auto
+            switch (g_app.injectionMode) {
+                case InjectionMode::Auto: modeIndex = 0; break;
+                case InjectionMode::Unicode: modeIndex = 1; break;
+                case InjectionMode::VKScancode: modeIndex = 2; break;
+                case InjectionMode::Hybrid: modeIndex = 3; break;
+            }
+            SendMessageW(g_app.hwndComboMode, CB_SETCURSEL, modeIndex, 0);
+
+            // Apply diagnostic mode setting
+            SendMessageW(g_app.hwndCheckDiag, BM_SETCHECK,
+                g_app.diagnosticMode ? BST_CHECKED : BST_UNCHECKED, 0);
 
             // Create tray icon
             CreateTrayIcon(hwnd);
@@ -1033,6 +1823,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     break;
                 }
+
+                case IDC_COMBO_MODE:
+                    if (HIWORD(wParam) == CBN_SELCHANGE) {
+                        int sel = (int)SendMessageW(g_app.hwndComboMode, CB_GETCURSEL, 0, 0);
+                        switch (sel) {
+                            case 0: g_app.injectionMode = InjectionMode::Auto; break;
+                            case 1: g_app.injectionMode = InjectionMode::Unicode; break;
+                            case 2: g_app.injectionMode = InjectionMode::VKScancode; break;
+                            case 3: g_app.injectionMode = InjectionMode::Hybrid; break;
+                        }
+                    }
+                    break;
+
+                case IDC_CHECK_DIAG:
+                    g_app.diagnosticMode = (SendMessageW(g_app.hwndCheckDiag, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    break;
 
                 case IDC_BUTTON_ARM:
                     if (g_app.isArmed) {
@@ -1174,6 +1980,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 // ============================================================================
+// Command Line Parsing
+// ============================================================================
+
+// Parse command line arguments
+// Supports: --diag, --mode=vk|hybrid|unicode|auto
+void ParseCommandLine() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+    if (!argv) return;
+
+    for (int i = 1; i < argc; i++) {
+        // --diag flag
+        if (_wcsicmp(argv[i], L"--diag") == 0) {
+            g_app.diagnosticMode = true;
+            continue;
+        }
+
+        // --mode=value
+        if (_wcsnicmp(argv[i], L"--mode=", 7) == 0) {
+            const wchar_t* modeStr = argv[i] + 7;
+            g_app.injectionMode = ParseInjectionMode(modeStr);
+            continue;
+        }
+    }
+
+    LocalFree(argv);
+}
+
+// ============================================================================
 // Entry Point
 // ============================================================================
 
@@ -1192,6 +2028,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     // Load settings before creating window
     LoadSettings();
+
+    // Parse command line (overrides INI settings)
+    ParseCommandLine();
 
     // Initialize GDI+
     GdiplusStartupInput gdiplusStartupInput;
