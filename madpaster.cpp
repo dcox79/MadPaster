@@ -74,7 +74,7 @@ const wchar_t* REMOTE_WINDOW_CLASSES[] = {
 
 // Window dimensions
 const int WINDOW_WIDTH = 400;
-const int WINDOW_HEIGHT = 390;
+const int WINDOW_HEIGHT = 415;
 
 // Control IDs
 #define IDC_RADIO_CLIPBOARD     101
@@ -89,6 +89,7 @@ const int WINDOW_HEIGHT = 390;
 #define IDC_SPIN_KEYSTROKE      110
 #define IDC_COMBO_MODE          111
 #define IDC_CHECK_DIAG          112
+#define IDC_PROGRESS            113
 
 // Timer IDs
 #define IDT_COUNTDOWN           201
@@ -104,6 +105,14 @@ const int WINDOW_HEIGHT = 390;
 #define IDM_TRAY_ARM            401
 #define IDM_TRAY_SHOW           402
 #define IDM_TRAY_EXIT           403
+
+// Hotkey IDs
+#define IDH_PASTE_HOTKEY        501
+
+// Floating progress window
+#define FLOATING_PROGRESS_CLASS L"MadPasterFloatingProgress"
+#define FLOATING_PROGRESS_WIDTH 300
+#define FLOATING_PROGRESS_HEIGHT 70
 
 // ============================================================================
 // Global Application State
@@ -124,7 +133,13 @@ struct AppState {
     HWND hwndButtonBrowse;
     HWND hwndStaticFilePath;
     HWND hwndStaticStatus;
+    HWND hwndProgress;
     HWND hwndLogo;
+
+    // Floating progress window (visible when minimized to tray)
+    HWND hwndFloatingProgress;
+    HWND hwndFloatingProgressBar;
+    HWND hwndFloatingLabel;
 
     NOTIFYICONDATA nid;
     bool minimizedToTray;
@@ -974,10 +989,14 @@ void ResetAbortFlag() {
 // Keyboard Simulation
 // ============================================================================
 
+// Progress callback type for injection progress reporting
+typedef void (*ProgressCallback)(size_t current, size_t total);
+
 // Extended injection function with mode and pacing configuration
 size_t sendTextToWindowEx(const std::wstring& text, InjectionMode mode,
                           const inject::PacingConfig& config,
-                          inject::DiagnosticState* diag) {
+                          inject::DiagnosticState* diag,
+                          ProgressCallback progressCallback = nullptr) {
     // Enable high-resolution timer for precise Sleep() calls
     inject::TimerResolutionGuard timerGuard;
 
@@ -1051,6 +1070,7 @@ size_t sendTextToWindowEx(const std::wstring& text, InjectionMode mode,
                 }
                 charsSent += charsInBuffer;
                 charsInBuffer = 0;
+                if (progressCallback) progressCallback(charsSent, text.size());
             }
 
             // Normalized newline handling - single unified pause
@@ -1061,6 +1081,7 @@ size_t sendTextToWindowEx(const std::wstring& text, InjectionMode mode,
             inject::SendEnterKey();
             charsSent++;
             charsSinceNewline = 0;  // Reset line-start counter
+            if (progressCallback) progressCallback(charsSent, text.size());
 
             // Brief pause after enter
             Sleep(config.baseKeystrokeDelayMs + NEWLINE_PAUSE_MS / 2);
@@ -1099,6 +1120,7 @@ size_t sendTextToWindowEx(const std::wstring& text, InjectionMode mode,
 
             charsSent += charsInBuffer;
             charsInBuffer = 0;
+            if (progressCallback) progressCallback(charsSent, text.size());
 
             // Calculate pause
             int pauseMs = config.baseKeystrokeDelayMs;
@@ -1144,6 +1166,7 @@ size_t sendTextToWindowEx(const std::wstring& text, InjectionMode mode,
             if (diag) diag->totalEventsSent += sent;
         }
         charsSent += charsInBuffer;
+        if (progressCallback) progressCallback(charsSent, text.size());
     }
 
     // Reset modifiers at end
@@ -1162,8 +1185,16 @@ size_t sendTextToWindowEx(const std::wstring& text, InjectionMode mode,
 std::wstring GetLogPath();
 void WriteDiagnosticLog(const std::wstring& content);
 
+// Forward declaration for progress callback
+void UpdateProgress(size_t current, size_t total);
+
+// Progress callback wrapper for UpdateProgress
+void ProgressCallbackWrapper(size_t current, size_t total) {
+    UpdateProgress(current, total);
+}
+
 // Original function - wrapper that auto-detects target and selects mode
-size_t sendTextToWindow(const std::wstring& text) {
+size_t sendTextToWindow(const std::wstring& text, bool showProgress = false) {
     // Detect remote client
     inject::RemoteClientInfo clientInfo = inject::DetectRemoteClient();
 
@@ -1206,7 +1237,10 @@ size_t sendTextToWindow(const std::wstring& text) {
     // Use configured injection mode (default: Auto)
     InjectionMode mode = g_app.injectionMode;
 
-    size_t result = sendTextToWindowEx(text, mode, config, diag);
+    // Set up progress callback if requested
+    ProgressCallback progressCb = showProgress ? ProgressCallbackWrapper : nullptr;
+
+    size_t result = sendTextToWindowEx(text, mode, config, diag, progressCb);
 
     // Log and display diagnostics if enabled
     if (diag) {
@@ -1409,8 +1443,28 @@ void MinimizeToTray() {
 }
 
 void RestoreFromTray() {
-    ShowWindow(g_app.hwndMain, SW_SHOW);
-    SetForegroundWindow(g_app.hwndMain);
+    HWND hwnd = g_app.hwndMain;
+
+    // Attach to foreground thread's input queue for reliable focus
+    HWND hwndFg = GetForegroundWindow();
+    DWORD fgThread = hwndFg ? GetWindowThreadProcessId(hwndFg, NULL) : 0;
+    DWORD myThread = GetCurrentThreadId();
+    bool attached = (fgThread && fgThread != myThread)
+                    ? AttachThreadInput(myThread, fgThread, TRUE) : false;
+
+    // Restore and bring to front
+    ShowWindow(hwnd, SW_RESTORE);
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+
+    // HWND_TOPMOST trick to force foreground
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
+    // Detach and set focus
+    if (attached) AttachThreadInput(myThread, fgThread, FALSE);
+    SetFocus(hwnd);
+
     g_app.minimizedToTray = false;
 }
 
@@ -1435,6 +1489,129 @@ void UpdateStatus(const wchar_t* status) {
     std::wstring fullStatus = L"Status: ";
     fullStatus += status;
     SetWindowTextW(g_app.hwndStaticStatus, fullStatus.c_str());
+}
+
+// Floating progress window procedure
+LRESULT CALLBACK FloatingProgressProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rect;
+            GetClientRect(hwnd, &rect);
+            // Fill with dark gray background
+            HBRUSH hBrush = CreateSolidBrush(RGB(45, 45, 48));
+            FillRect(hdc, &rect, hBrush);
+            DeleteObject(hBrush);
+            // Draw border
+            HPEN hPen = CreatePen(PS_SOLID, 1, RGB(80, 80, 80));
+            HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+            HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
+            SelectObject(hdc, hOldPen);
+            SelectObject(hdc, hOldBrush);
+            DeleteObject(hPen);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_CTLCOLORSTATIC: {
+            HDC hdcStatic = (HDC)wParam;
+            SetTextColor(hdcStatic, RGB(255, 255, 255));
+            SetBkColor(hdcStatic, RGB(45, 45, 48));
+            static HBRUSH hBrushStatic = CreateSolidBrush(RGB(45, 45, 48));
+            return (LRESULT)hBrushStatic;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void CreateFloatingProgressWindow() {
+    if (g_app.hwndFloatingProgress) return;  // Already created
+
+    // Register the floating progress window class
+    WNDCLASSEXW wcFloat = {};
+    wcFloat.cbSize = sizeof(WNDCLASSEXW);
+    wcFloat.lpfnWndProc = FloatingProgressProc;
+    wcFloat.hInstance = g_app.hInstance;
+    wcFloat.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wcFloat.lpszClassName = FLOATING_PROGRESS_CLASS;
+    RegisterClassExW(&wcFloat);
+
+    // Get screen dimensions for centering
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    int x = (screenWidth - FLOATING_PROGRESS_WIDTH) / 2;
+    int y = (screenHeight - FLOATING_PROGRESS_HEIGHT) / 2;
+
+    // Create the floating window (popup, always on top, no taskbar entry)
+    g_app.hwndFloatingProgress = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        FLOATING_PROGRESS_CLASS,
+        L"MadPaster",
+        WS_POPUP,
+        x, y, FLOATING_PROGRESS_WIDTH, FLOATING_PROGRESS_HEIGHT,
+        NULL, NULL, g_app.hInstance, NULL);
+
+    // Create progress bar inside the floating window
+    g_app.hwndFloatingProgressBar = CreateWindowW(PROGRESS_CLASSW, NULL,
+        WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
+        10, 10, FLOATING_PROGRESS_WIDTH - 20, 20,
+        g_app.hwndFloatingProgress, NULL, g_app.hInstance, NULL);
+    SendMessageW(g_app.hwndFloatingProgressBar, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+
+    // Create "Press ESC to cancel" label
+    g_app.hwndFloatingLabel = CreateWindowW(L"STATIC", L"Press ESC to cancel",
+        WS_CHILD | WS_VISIBLE | SS_CENTER,
+        10, 40, FLOATING_PROGRESS_WIDTH - 20, 20,
+        g_app.hwndFloatingProgress, NULL, g_app.hInstance, NULL);
+    if (g_app.hFontUI) {
+        SendMessageW(g_app.hwndFloatingLabel, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
+    }
+}
+
+// Progress bar helper functions (now uses floating window)
+void ShowProgress() {
+    CreateFloatingProgressWindow();
+    if (g_app.hwndFloatingProgress) {
+        SendMessageW(g_app.hwndFloatingProgressBar, PBM_SETPOS, 0, 0);
+        ShowWindow(g_app.hwndFloatingProgress, SW_SHOWNOACTIVATE);
+    }
+    // Also update embedded progress bar
+    if (g_app.hwndProgress) {
+        SendMessageW(g_app.hwndProgress, PBM_SETPOS, 0, 0);
+        ShowWindow(g_app.hwndProgress, SW_SHOW);
+    }
+}
+
+void HideProgress() {
+    if (g_app.hwndFloatingProgress) {
+        ShowWindow(g_app.hwndFloatingProgress, SW_HIDE);
+        SendMessageW(g_app.hwndFloatingProgressBar, PBM_SETPOS, 0, 0);
+    }
+    if (g_app.hwndProgress) {
+        ShowWindow(g_app.hwndProgress, SW_HIDE);
+        SendMessageW(g_app.hwndProgress, PBM_SETPOS, 0, 0);
+    }
+}
+
+void UpdateProgress(size_t current, size_t total) {
+    if (total > 0) {
+        int percent = static_cast<int>((current * 100) / total);
+        // Update floating progress bar
+        if (g_app.hwndFloatingProgressBar) {
+            SendMessageW(g_app.hwndFloatingProgressBar, PBM_SETPOS, percent, 0);
+        }
+        // Update embedded progress bar
+        if (g_app.hwndProgress) {
+            SendMessageW(g_app.hwndProgress, PBM_SETPOS, percent, 0);
+        }
+    }
+    // Pump messages to keep UI responsive
+    MSG msg;
+    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
 }
 
 void ResetArmState() {
@@ -1510,7 +1687,9 @@ void ExecutePaste() {
 
     if (success && !textContent.empty()) {
         if (textContent.length() < static_cast<size_t>(maxchar)) {
-            size_t charsSent = sendTextToWindow(textContent);
+            ShowProgress();
+            size_t charsSent = sendTextToWindow(textContent, true);
+            HideProgress();
             if (charsSent < textContent.length()) {
                 // User pressed ESC - restore window and show progress
                 RestoreFromTray();
@@ -1529,7 +1708,65 @@ void ExecutePaste() {
         }
     }
 
+    HideProgress();
     ResetArmState();
+}
+
+// Execute immediate paste from global hotkey (CTRL+ALT+V)
+void ExecuteImmediatePaste() {
+    // Don't interrupt if already armed
+    if (g_app.isArmed) return;
+
+    // Get clipboard content
+    if (!openClipboard()) return;
+    std::wstring text = getClipboardText();
+    closeClipboard();
+
+    if (text.empty()) return;
+    if (text.length() >= static_cast<size_t>(maxchar)) {
+        MessageBox(NULL, L"Clipboard text exceeds maximum length.",
+                   L"MadPaster - Error", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+        return;
+    }
+
+    // Minimize to tray before pasting
+    MinimizeToTray();
+
+    // Wait for focus to stabilize on target window
+    HWND hwndSelf = g_app.hwndMain;
+    int stableCount = 0;
+    DWORD startTime = GetTickCount();
+    const DWORD FOCUS_TIMEOUT_MS = 1000;
+
+    while (stableCount < 3) {
+        Sleep(50);
+        HWND hwndFg = GetForegroundWindow();
+        if (hwndFg != hwndSelf && hwndFg != NULL) {
+            stableCount++;
+        } else {
+            stableCount = 0;
+        }
+        if (GetTickCount() - startTime > FOCUS_TIMEOUT_MS) {
+            break;
+        }
+    }
+
+    // Show progress bar and inject with ESC handling enabled
+    ShowProgress();
+    size_t charsSent = sendTextToWindow(text, true);
+    HideProgress();
+
+    // Handle interruption
+    if (charsSent < text.length()) {
+        RestoreFromTray();
+        std::wstring msg = L"Interrupted at " + std::to_wstring(charsSent) +
+                           L" / " + std::to_wstring(text.length()) + L" characters";
+        UpdateStatus(msg.c_str());
+        return;
+    }
+
+    // Restore from tray after successful paste
+    RestoreFromTray();
 }
 
 void StartArmCountdown() {
@@ -1766,10 +2003,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                 24, 230, 352, 50, hwnd, (HMENU)IDC_BUTTON_ARM, hInst, NULL);
 
+            // Progress bar (hidden by default, shown during paste)
+            g_app.hwndProgress = CreateWindowW(PROGRESS_CLASSW, NULL,
+                WS_CHILD | PBS_SMOOTH,
+                24, 285, 352, 20, hwnd, (HMENU)IDC_PROGRESS, hInst, NULL);
+            SendMessageW(g_app.hwndProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+
             // Status label
             g_app.hwndStaticStatus = CreateWindowW(L"STATIC", L"Status: Ready - ARM Starts MadPaster  ESC Interrupts MadPaster",
                 WS_CHILD | WS_VISIBLE,
-                24, 295, 352, 20, hwnd, (HMENU)IDC_STATIC_STATUS, hInst, NULL);
+                24, 310, 352, 20, hwnd, (HMENU)IDC_STATIC_STATUS, hInst, NULL);
             SendMessageW(g_app.hwndStaticStatus, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
 
             // Apply saved settings to controls
@@ -1800,8 +2043,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Create tray icon
             CreateTrayIcon(hwnd);
 
+            // Register global hotkey (CTRL+ALT+V)
+            if (!RegisterHotKey(hwnd, IDH_PASTE_HOTKEY, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'V')) {
+                DWORD err = GetLastError();
+                wchar_t msg[128];
+                swprintf_s(msg, L"Failed to register CTRL+ALT+V hotkey (error %lu). Another app may have it.", err);
+                MessageBoxW(hwnd, msg, L"MadPaster - Warning", MB_OK | MB_ICONWARNING);
+            }
+
             break;
         }
+
+        case WM_HOTKEY:
+            if (wParam == IDH_PASTE_HOTKEY) {
+                ExecuteImmediatePaste();
+            }
+            break;
 
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
@@ -1952,12 +2209,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
 
         case WM_CLOSE:
+            UnregisterHotKey(hwnd, IDH_PASTE_HOTKEY);
             SaveSettings();
             RemoveTrayIcon();
             DestroyWindow(hwnd);
             break;
 
         case WM_DESTROY:
+            // Clean up floating progress window
+            if (g_app.hwndFloatingProgress) {
+                DestroyWindow(g_app.hwndFloatingProgress);
+                g_app.hwndFloatingProgress = NULL;
+            }
+
             // Clean up custom fonts
             if (g_app.hFontUI) DeleteObject(g_app.hFontUI);
             if (g_app.hFontMono) DeleteObject(g_app.hFontMono);

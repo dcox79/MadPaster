@@ -7,12 +7,6 @@
 # User settings
 madpaster.ini
 
-# Claude Code local directory
-.claude/
-claude-docs/
-
-# Claude Code - Local only
-CLAUDE.md
 PLAN.md
 
 # TestFiles
