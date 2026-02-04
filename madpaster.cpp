@@ -1194,7 +1194,40 @@ void ProgressCallbackWrapper(size_t current, size_t total) {
 }
 
 // Original function - wrapper that auto-detects target and selects mode
+// Normalize typographic Unicode characters to ASCII equivalents
+// Prevents garbled output in remote desktop sessions (Citrix, RDP, VNC)
+std::wstring NormalizeSmartCharacters(const std::wstring& input) {
+    std::wstring result;
+    result.reserve(input.size());
+    for (wchar_t c : input) {
+        switch (c) {
+            case L'\u2018': // LEFT SINGLE QUOTATION MARK
+            case L'\u2019': // RIGHT SINGLE QUOTATION MARK
+                result += L'\'';
+                break;
+            case L'\u201C': // LEFT DOUBLE QUOTATION MARK
+            case L'\u201D': // RIGHT DOUBLE QUOTATION MARK
+                result += L'"';
+                break;
+            case L'\u2013': // EN DASH
+            case L'\u2014': // EM DASH
+                result += L'-';
+                break;
+            case L'\u2026': // HORIZONTAL ELLIPSIS
+                result += L"...";
+                break;
+            default:
+                result += c;
+                break;
+        }
+    }
+    return result;
+}
+
 size_t sendTextToWindow(const std::wstring& text, bool showProgress = false) {
+    // Normalize smart quotes/dashes to ASCII for remote desktop compatibility
+    std::wstring normalizedText = NormalizeSmartCharacters(text);
+
     // Detect remote client
     inject::RemoteClientInfo clientInfo = inject::DetectRemoteClient();
 
@@ -1208,7 +1241,7 @@ size_t sendTextToWindow(const std::wstring& text, bool showProgress = false) {
         diag = &diagState;
 
         // Populate context info
-        diag->totalCharsRequested = text.length();
+        diag->totalCharsRequested = normalizedText.length();
         diag->targetClassName = clientInfo.className;
         diag->targetIsRemote = clientInfo.isRemote;
 
@@ -1240,7 +1273,7 @@ size_t sendTextToWindow(const std::wstring& text, bool showProgress = false) {
     // Set up progress callback if requested
     ProgressCallback progressCb = showProgress ? ProgressCallbackWrapper : nullptr;
 
-    size_t result = sendTextToWindowEx(text, mode, config, diag, progressCb);
+    size_t result = sendTextToWindowEx(normalizedText, mode, config, diag, progressCb);
 
     // Log and display diagnostics if enabled
     if (diag) {
