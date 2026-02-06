@@ -74,7 +74,7 @@ const wchar_t* REMOTE_WINDOW_CLASSES[] = {
 
 // Window dimensions
 const int WINDOW_WIDTH = 400;
-const int WINDOW_HEIGHT = 415;
+const int WINDOW_HEIGHT = 439;
 
 // Control IDs
 #define IDC_RADIO_CLIPBOARD     101
@@ -90,6 +90,7 @@ const int WINDOW_HEIGHT = 415;
 #define IDC_COMBO_MODE          111
 #define IDC_CHECK_DIAG          112
 #define IDC_PROGRESS            113
+#define IDC_CHECK_SILENT        114
 
 // Timer IDs
 #define IDT_COUNTDOWN           201
@@ -129,6 +130,7 @@ struct AppState {
     HWND hwndSpinKeystroke;
     HWND hwndComboMode;
     HWND hwndCheckDiag;
+    HWND hwndCheckSilent;
     HWND hwndButtonArm;
     HWND hwndButtonBrowse;
     HWND hwndStaticFilePath;
@@ -169,6 +171,7 @@ struct AppState {
     // Injection settings
     InjectionMode injectionMode;
     bool diagnosticMode;
+    bool silentMode;
 };
 
 static AppState g_app = {};
@@ -1404,6 +1407,9 @@ void LoadSettings() {
 
     // Diagnostic mode (default off, usually set via CLI)
     g_app.diagnosticMode = (GetPrivateProfileIntW(L"Settings", L"DiagnosticMode", 0, iniPath.c_str()) != 0);
+
+    // Silent mode (stay in tray after hotkey paste)
+    g_app.silentMode = (GetPrivateProfileIntW(L"Settings", L"SilentMode", 0, iniPath.c_str()) != 0);
 }
 
 void SaveSettings() {
@@ -1421,6 +1427,8 @@ void SaveSettings() {
         InjectionModeToString(g_app.injectionMode), iniPath.c_str());
     WritePrivateProfileStringW(L"Settings", L"DiagnosticMode",
         g_app.diagnosticMode ? L"1" : L"0", iniPath.c_str());
+    WritePrivateProfileStringW(L"Settings", L"SilentMode",
+        g_app.silentMode ? L"1" : L"0", iniPath.c_str());
 }
 
 // ============================================================================
@@ -1663,6 +1671,7 @@ void ResetArmState() {
     EnableWindow(g_app.hwndSpinKeystroke, TRUE);
     EnableWindow(g_app.hwndComboMode, TRUE);
     EnableWindow(g_app.hwndCheckDiag, TRUE);
+    EnableWindow(g_app.hwndCheckSilent, TRUE);
 
     UpdateArmButtonText();
     UpdateStatus(L"Ready - ARM Starts MadPaster  ESC Interrupts MadPaster");
@@ -1750,14 +1759,25 @@ void ExecuteImmediatePaste() {
     // Don't interrupt if already armed
     if (g_app.isArmed) return;
 
-    // Get clipboard content
-    if (!openClipboard()) return;
-    std::wstring text = getClipboardText();
-    closeClipboard();
+    // Get text content based on mode
+    std::wstring text;
+
+    if (g_app.useClipboard) {
+        if (!openClipboard()) return;
+        text = getClipboardText();
+        closeClipboard();
+    } else {
+        if (g_app.selectedFilePath.empty()) return;
+        DWORD attrs = GetFileAttributesW(g_app.selectedFilePath.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return;
+        bool success = false;
+        text = readFileContents(g_app.selectedFilePath, success);
+        if (!success) return;
+    }
 
     if (text.empty()) return;
     if (text.length() >= static_cast<size_t>(maxchar)) {
-        MessageBox(NULL, L"Clipboard text exceeds maximum length.",
+        MessageBox(NULL, L"Text exceeds maximum length.",
                    L"MadPaster - Error", MB_OK | MB_ICONWARNING | MB_TOPMOST);
         return;
     }
@@ -1798,8 +1818,10 @@ void ExecuteImmediatePaste() {
         return;
     }
 
-    // Restore from tray after successful paste
-    RestoreFromTray();
+    // Restore from tray after successful paste (unless silent mode)
+    if (!g_app.silentMode) {
+        RestoreFromTray();
+    }
 }
 
 void StartArmCountdown() {
@@ -1849,6 +1871,7 @@ void StartArmCountdown() {
     EnableWindow(g_app.hwndSpinKeystroke, FALSE);
     EnableWindow(g_app.hwndComboMode, FALSE);
     EnableWindow(g_app.hwndCheckDiag, FALSE);
+    EnableWindow(g_app.hwndCheckSilent, FALSE);
 
     if (g_app.delaySeconds > 0) {
         UpdateArmButtonText();
@@ -2031,21 +2054,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 250, 196, 110, 20, hwnd, (HMENU)IDC_CHECK_DIAG, hInst, NULL);
             SendMessageW(g_app.hwndCheckDiag, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
 
+            // Silent mode checkbox (stay in tray after hotkey paste)
+            g_app.hwndCheckSilent = CreateWindowW(L"BUTTON", L"Silent (stay in tray after paste)",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                24, 218, 340, 20, hwnd, (HMENU)IDC_CHECK_SILENT, hInst, NULL);
+            SendMessageW(g_app.hwndCheckSilent, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
+
             // ARM button (large, prominent, owner-drawn)
             g_app.hwndButtonArm = CreateWindowW(L"BUTTON", L"ARM",
                 WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                24, 230, 352, 50, hwnd, (HMENU)IDC_BUTTON_ARM, hInst, NULL);
+                24, 254, 352, 50, hwnd, (HMENU)IDC_BUTTON_ARM, hInst, NULL);
 
             // Progress bar (hidden by default, shown during paste)
             g_app.hwndProgress = CreateWindowW(PROGRESS_CLASSW, NULL,
                 WS_CHILD | PBS_SMOOTH,
-                24, 285, 352, 20, hwnd, (HMENU)IDC_PROGRESS, hInst, NULL);
+                24, 309, 352, 20, hwnd, (HMENU)IDC_PROGRESS, hInst, NULL);
             SendMessageW(g_app.hwndProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
 
             // Status label
             g_app.hwndStaticStatus = CreateWindowW(L"STATIC", L"Status: Ready - ARM Starts MadPaster  ESC Interrupts MadPaster",
                 WS_CHILD | WS_VISIBLE,
-                24, 310, 352, 20, hwnd, (HMENU)IDC_STATIC_STATUS, hInst, NULL);
+                24, 334, 352, 20, hwnd, (HMENU)IDC_STATIC_STATUS, hInst, NULL);
             SendMessageW(g_app.hwndStaticStatus, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
 
             // Apply saved settings to controls
@@ -2072,6 +2101,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Apply diagnostic mode setting
             SendMessageW(g_app.hwndCheckDiag, BM_SETCHECK,
                 g_app.diagnosticMode ? BST_CHECKED : BST_UNCHECKED, 0);
+
+            // Apply silent mode setting
+            SendMessageW(g_app.hwndCheckSilent, BM_SETCHECK,
+                g_app.silentMode ? BST_CHECKED : BST_UNCHECKED, 0);
 
             // Create tray icon
             CreateTrayIcon(hwnd);
@@ -2128,6 +2161,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 case IDC_CHECK_DIAG:
                     g_app.diagnosticMode = (SendMessageW(g_app.hwndCheckDiag, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    break;
+
+                case IDC_CHECK_SILENT:
+                    g_app.silentMode = (SendMessageW(g_app.hwndCheckSilent, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     break;
 
                 case IDC_BUTTON_ARM:
