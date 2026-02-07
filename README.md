@@ -6,6 +6,7 @@ A Windows utility that simulates keyboard strokes to paste clipboard or file con
 
 ## Features
 
+- **Dual Triggers**: Paste via CTRL + ALT + V or the ARM button. Use esc to interrupt paste.
 - **Dual Input Modes**: Paste from clipboard or file
 - **Countdown Timer**: Configurable 0-60 second delay before pasting
 - **Adjustable Speed**: Keystroke delay from 0-100ms for compatibility
